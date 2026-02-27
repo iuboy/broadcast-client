@@ -1,0 +1,13 @@
+{
+  "update": {
+    "enabled": true,
+    "checkInterval": 86400,
+    "autoInstallOnExit": true,
+    "showNotification": true,
+    "endpoints": [
+      "https://your-update-server.com/{{target}}/{{current_version}}"
+    ],
+    "currentVersion": "0.1.0",
+    "releaseNotes": ""
+  }
+}
