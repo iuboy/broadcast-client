@@ -239,7 +239,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onBeforeUnmount, onMounted, watch, reactive } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage, ElNotification } from 'element-plus';
 import { useWebSocket } from '@/utils/useWebSocket';
 import { useAppUpdate } from '@/utils/useAppUpdate';
 import { APP_CONFIG } from '@/config';
