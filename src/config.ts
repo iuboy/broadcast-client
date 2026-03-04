@@ -26,7 +26,7 @@ export const APP_CONFIG: {
 } = {
   // WebSocket服务器地址
   // 可以通过环境变量 VITE_WS_URL 覆盖
-  WS_URL: (import.meta.env.VITE_WS_URL as string) || 'ws://192.168.66.74:8080/ws',
+  WS_URL: (import.meta.env.VITE_WS_URL as string) || 'ws://localhost:8081/ws',
 
   // 默认音频配置
   DEFAULT_CODEC: 'pcm',

@@ -2,14 +2,21 @@
 //!
 //! 用于连接到 broadcast-manager 并推送音频数据
 
+mod websocket_client;
+
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use tauri::Manager;
 use tauri_plugin_updater::UpdaterExt;
+use tracing_subscriber::prelude::*;
+
+// 导出 WebSocket 客户端命令
+use websocket_client::{ws_start_broadcast, ws_stop_broadcast, ws_send_audio, ws_get_state};
 
 /// 配置文件结构
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     /// WebSocket 服务器地址
     pub server_url: String,
@@ -22,7 +29,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            server_url: "ws://localhost:8080/broadcast".to_string(),
+            server_url: "ws://localhost:8081/ws".to_string(),
             default_codec: "pcm".to_string(),
             default_volume: 1.0,
         }
@@ -170,8 +177,68 @@ async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
     }
 }
 
+/// 从前端写入日志到文件
+#[tauri::command]
+fn log_to_file(level: String, tag: String, message: String) {
+    match level.as_str() {
+        "error" => tracing::error!("[{}] {}", tag, message),
+        "warn" => tracing::warn!("[{}] {}", tag, message),
+        _ => tracing::info!("[{}] {}", tag, message),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 初始化日志系统 - 同时输出到控制台和文件
+    let log_dir = dirs::home_dir()
+        .map(|home| home.join(".broadcast-client").join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // 确保日志目录存在
+    std::fs::create_dir_all(&log_dir).unwrap_or_else(|e| {
+        eprintln!("无法创建日志目录 {:?}: {}", log_dir, e);
+    });
+
+    let log_path = log_dir.join("broadcast-client.log");
+    eprintln!("日志目录: {:?}", log_dir);
+
+    // 配置文件日志记录器（按天轮转）
+    let file_appender = tracing_appender::rolling::daily(log_dir.clone(), "broadcast-client");
+
+    // 创建非阻塞写入器
+    let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // 配置日志订阅器 - 同时输出到控制台和文件
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+
+    // 控制台层
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_thread_ids(false)
+        .with_file(true)
+        .with_line_number(true);
+
+    // 文件层
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking_appender)
+        .with_ansi(false)
+        .with_thread_ids(false)
+        .with_file(true)
+        .with_line_number(true);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
+        .init();
+
+    tracing::info!("广播客户端启动中...");
+    tracing::info!("日志文件: {:?}", log_path);
+
+    // 保留 _guard 以防止文件日志过早关闭
+    std::mem::forget(_guard);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -182,6 +249,11 @@ pub fn run() {
             read_config,
             write_config,
             get_config_path_str,
+            log_to_file,
+            ws_start_broadcast,
+            ws_stop_broadcast,
+            ws_send_audio,
+            ws_get_state,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|e| {

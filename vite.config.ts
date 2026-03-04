@@ -16,8 +16,8 @@ export default defineConfig(async () => ({
   
   // 2. 开发服务器配置：Tauri 要求固定端口，如果端口不可用则失败
   server: {
-    // 开发服务器端口号
-    port: 1420,
+    // 开发服务器端口号（修改为 1422，避免与 broadcast-manager 的 1420 冲突）
+    port: 1422,
     // 严格端口模式：端口被占用时报错而不是自动切换
     strictPort: true,
     // 服务器监听的主机地址（从环境变量获取，用于远程调试）
@@ -29,8 +29,8 @@ export default defineConfig(async () => ({
           protocol: "ws",
           // HMR 主机地址
           host,
-          // HMR 端口号
-          port: 1421,
+          // HMR 端口号（修改为 1423）
+          port: 1423,
         }
       : undefined,
     // 文件监听配置

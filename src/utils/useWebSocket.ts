@@ -49,6 +49,7 @@ export const useWebSocket = (url: string, options: UseWebSocketOptions = {}) => 
   };
 
   const handleMessage = (event: WebSocketEventMap['message']) => {
+    console.log('[WebSocket] Raw message received:', event.data, 'Type:', typeof event.data);
     onMessage?.(event.data);
   };
 
@@ -78,9 +79,11 @@ export const useWebSocket = (url: string, options: UseWebSocketOptions = {}) => 
       return false;
     }
 
+    console.log('[WebSocket] Attempting to send:', data, 'ReadyState:', ws.readyState);
     // 然后检查连接状态
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(data);
+      console.log('[WebSocket] Sent successfully');
       return true;
     }
 

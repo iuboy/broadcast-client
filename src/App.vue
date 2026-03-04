@@ -51,7 +51,6 @@
             <span v-if="connectionStatus === 'connected'">✅</span>
             <span v-else-if="connectionStatus === 'disconnected'">❌</span>
             <span v-else-if="connectionStatus === 'connecting'">⏳</span>
-            <span v-else-if="connectionStatus === 'reconnecting'">🔄</span>
             <span v-else>⚪</span>
           </div>
           <div class="status-text">
@@ -95,24 +94,24 @@
         <button
           class="broadcast-btn"
           :class="{ broadcasting: isBroadcasting }"
-          :disabled="connectionStatus === 'busy' || connectionStatus === 'disconnected'"
-          @mousedown="startBroadcast"
-          @mouseup="stopBroadcast"
-          @mouseleave="stopBroadcast"
-          @touchstart.prevent="startBroadcast"
-          @touchend.prevent="stopBroadcast"
+          :disabled="(connectionStatus === 'busy' || connectionStatus === 'connecting') && !isBroadcasting"
+          @click="toggleBroadcast"
         >
-          <template v-if="connectionStatus === 'busy'">
+          <template v-if="connectionStatus === 'busy' && !isBroadcasting">
             <span class="btn-icon">🚫</span>
             <span>广播被占用</span>
           </template>
+          <template v-else-if="connectionStatus === 'disconnected' && !isBroadcasting">
+            <span class="btn-icon">🔄</span>
+            <span>重试连接</span>
+          </template>
           <template v-else-if="!isBroadcasting">
             <span class="btn-icon">🎙️</span>
-            <span>按住说话</span>
+            <span>点击说话</span>
           </template>
           <template v-else>
             <span class="btn-icon">🔴</span>
-            <span>广播中...</span>
+            <span>点击停止</span>
           </template>
         </button>
 
@@ -122,7 +121,7 @@
           <span class="timer-text">{{ formatTime(broadcastDuration) }}</span>
         </div>
         <div v-else class="hints-section">
-          按住按钮或空格键开始广播
+          点击按钮开始广播
         </div>
       </div>
     </main>
@@ -204,7 +203,7 @@
         <el-form-item label="服务器地址">
           <el-input
             v-model="settingsForm.serverUrl"
-            placeholder="ws://localhost:8080/broadcast"
+            placeholder="ws://localhost:8081/ws"
           />
         </el-form-item>
         <el-form-item label="默认编码">
@@ -240,11 +239,19 @@
 <script setup lang="ts">
 import { ref, computed, onBeforeUnmount, onMounted, watch, reactive } from 'vue';
 import { ElMessage, ElNotification } from 'element-plus';
-import { useWebSocket } from '@/utils/useWebSocket';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useAppUpdate } from '@/utils/useAppUpdate';
 import { APP_CONFIG } from '@/config';
 import { readConfig, writeConfig, getConfigPath, type AppConfig } from '@/composables';
 import type { CodecType } from '@/types/index';
+import { createLogger } from '@/utils/logger';
+
+const logger = createLogger('App');
+const configLogger = createLogger('Config');
+const broadcastLogger = createLogger('Broadcast');
+const audioLogger = createLogger('AudioProcessing');
+const eventLogger = createLogger('Event');
 
 const codec = ref<CodecType>(APP_CONFIG.DEFAULT_CODEC);
 const volume = ref(APP_CONFIG.DEFAULT_VOLUME);
@@ -255,7 +262,7 @@ const configFilePath = ref('');
 
 // 设置表单
 const settingsForm = reactive<AppConfig>({
-  serverUrl: 'ws://localhost:8080/broadcast',
+  serverUrl: 'ws://localhost:8081/ws',
   defaultCodec: 'pcm',
   defaultVolume: 1.0,
 });
@@ -279,7 +286,8 @@ const busyDuration = ref(0);
 const broadcastDuration = ref(0);
 const broadcastStartTime = ref<Date | null>(null);
 
-const ws = ref<ReturnType<typeof useWebSocket> | null>(null);
+// WebSocket 相关（保留用于状态检查，但不直接使用）
+// ws.value 不再直接使用，而是通过 Rust 后端管理
 let audioContext: AudioContext | null = null;
 let processor: AudioWorkletNode | null = null;
 let stream: MediaStream | null = null;
@@ -288,6 +296,10 @@ let gainNode: GainNode | null = null;
 let broadcastTimer: number | null = null;
 let busyTimer: number | null = null;
 const maxBroadcastTime = 5 * 60;
+let targetSampleRate = 0; // 将从 AudioContext 获取实际硬件采样率
+
+// Tauri 事件监听器清理函数
+const eventListeners: Array<() => void> = [];
 
 // 预加载状态管理
 const preloadState = ref({
@@ -309,10 +321,9 @@ const loadPreferences = () => {
   }
 };
 
-// 监听音量变化 - 移到 setup 顶层作用域
+// 监听音量变化
 watch(volume, (newVolume) => {
   if (gainNode) {
-    console.log(`[Volume] 实时更新音量: ${newVolume}`);
     gainNode.gain.value = newVolume;
   }
 });
@@ -325,9 +336,8 @@ const loadConfigFile = async () => {
     settingsForm.serverUrl = config.serverUrl;
     settingsForm.defaultCodec = config.defaultCodec;
     settingsForm.defaultVolume = config.defaultVolume;
-    console.log('[Config] 配置文件已加载:', config);
   } catch (error) {
-    console.error('[Config] 加载配置文件失败:', error);
+    configLogger.error(`加载配置失败: ${error}`);
   }
 };
 
@@ -340,7 +350,7 @@ const showSettingsDialog = async () => {
     settingsForm.defaultCodec = config.defaultCodec;
     settingsForm.defaultVolume = config.defaultVolume;
   } catch (error) {
-    console.error('[Config] 加载配置失败:', error);
+    configLogger.error(`加载配置失败: ${error}`);
   }
   settingsDialogVisible.value = true;
 };
@@ -355,7 +365,7 @@ const saveSettings = async () => {
     ElMessage.success('设置已保存');
     settingsDialogVisible.value = false;
   } catch (error) {
-    console.error('[Config] 保存配置失败:', error);
+    configLogger.error(`保存配置失败: ${error}`);
     ElMessage.error('保存设置失败');
   }
 };
@@ -367,7 +377,6 @@ const preloadAudioResources = async () => {
   }
 
   preloadState.value.isPreloading = true;
-  console.log('[Preload] 开始预加载音频资源...');
 
   const maxRetries = 3;
   let retryCount = 0;
@@ -375,47 +384,28 @@ const preloadAudioResources = async () => {
   while (retryCount < maxRetries) {
     try {
       if (!audioContext) {
-        // 使用类型安全的 AudioContext 创建方式
         const AudioContextConstructor = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext;
         audioContext = new AudioContextConstructor();
-        console.log('[Preload] AudioContext 已创建, sampleRate:', audioContext.sampleRate);
 
         if (audioContext.state === 'suspended') {
           await audioContext.resume();
-          console.log('[Preload] AudioContext 已恢复');
         }
         preloadState.value.audioContextLoaded = true;
       }
-
-      if (!preloadState.value.audioWorkletLoaded) {
-        await audioContext.audioWorklet.addModule('/src/audio-processor.ts');
-        console.log('[Preload] AudioWorklet 模块已加载');
-        preloadState.value.audioWorkletLoaded = true;
-      }
-
-      console.log('[Preload] ✅ 音频资源预加载完成');
       break;
     } catch (err) {
       retryCount++;
-      console.warn(`[Preload] 预加载失败，重试 ${retryCount}/${maxRetries}:`, err);
-
       if (retryCount >= maxRetries) {
-        console.error('[Preload] ❌ 预加载失败，将在广播时重试');
-        // 向用户显示通知
         ElNotification.warning({
           title: '音频资源预加载失败',
           message: '首次广播时可能需要额外时间加载音频资源',
           duration: 5000,
           position: 'top-right',
         });
-        // 清理已创建的 AudioContext 以避免状态不一致
         if (audioContext) {
           try {
             await audioContext.close();
-            console.log('[Preload] AudioContext 已关闭');
-          } catch (err) {
-            console.warn('[Preload] 关闭 AudioContext 时出错:', err);
-          }
+          } catch (e) { /* ignore */ }
           audioContext = null;
         }
         preloadState.value.audioContextLoaded = false;
@@ -440,8 +430,7 @@ const saveVolumePreference = () => {
 
 // Connection status
 const connectionStatus = computed(() => {
-  if (ws.value && ws.value.status() === 'reconnecting') return 'reconnecting';
-  if (ws.value && ws.value.status() === 'connecting') return 'connecting';
+  if (isConnecting.value) return 'connecting';
   if (isBroadcasting.value) return 'connected';
   if (status.value.includes('占用') || status.value.includes('busy')) return 'busy';
   if (status.value.includes('错误') || status.value.includes('失败')) return 'disconnected';
@@ -452,9 +441,8 @@ const getStatusLabel = computed(() => {
   switch (connectionStatus.value) {
     case 'connected': return '广播中';
     case 'connecting': return '连接中';
-    case 'reconnecting': return '重连中';
     case 'busy': return '广播被占用';
-    case 'disconnected': return '已断开';
+    case 'disconnected': return '连接失败';
     default: return '准备就绪';
   }
 });
@@ -503,18 +491,22 @@ const formatReleaseNotes = (notes: string | null) => {
     .replace(/\n/g, '<br>');
 };
 
-// Keyboard handler
-const handleKeyDown = async (e: KeyboardEvent) => {
-  if (e.code === 'Space' && !e.repeat && !isBroadcasting.value && connectionStatus.value !== 'busy') {
-    e.preventDefault();
+// 切换广播状态（点击按钮）
+const toggleBroadcast = async () => {
+  if (isBroadcasting.value) {
+    // 如果正在广播，则停止
+    stopBroadcast();
+  } else {
+    // 如果没有广播，则开始
     await startBroadcast();
   }
 };
 
-const handleKeyUp = (e: KeyboardEvent) => {
-  if (e.code === 'Space' && isBroadcasting.value) {
+// Keyboard handler - 空格键切换广播
+const handleKeyDown = async (e: KeyboardEvent) => {
+  if (e.code === 'Space' && !e.repeat) {
     e.preventDefault();
-    stopBroadcast();
+    await toggleBroadcast();
   }
 };
 
@@ -547,15 +539,6 @@ const stopBroadcastTimer = () => {
   broadcastStartTime.value = null;
 };
 
-// Busy timer
-const startBusyTimer = () => {
-  busyDuration.value = 0;
-
-  busyTimer = window.setInterval(() => {
-    busyDuration.value += 0.1;
-  }, 100);
-};
-
 const stopBusyTimer = () => {
   if (busyTimer) {
     clearInterval(busyTimer);
@@ -565,16 +548,12 @@ const stopBusyTimer = () => {
 };
 
 const startBroadcast = async () => {
-  if (isOperating.value) {
-    console.log('[Broadcast] 操作进行中，忽略请求');
-    return;
-  }
+  if (isOperating.value) return;
   if (isBroadcasting.value || isConnecting.value) return;
   if (connectionStatus.value === 'busy') return;
   if (!codec.value) return;
 
   isOperating.value = true;
-  console.log('[Broadcast] 开始广播流程');
 
   try {
     setStatus('请求麦克风权限...');
@@ -585,145 +564,70 @@ const startBroadcast = async () => {
     };
 
     stream = await navigator.mediaDevices.getUserMedia(constraints);
-    console.log('[Broadcast] MediaStream obtained:', stream.id);
 
     setStatus('正在连接服务器...');
 
     if (!audioContext || !preloadState.value.audioContextLoaded) {
-      console.log('[Broadcast] AudioContext 未预加载，立即创建...');
       const AudioContextConstructor = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext;
       audioContext = new AudioContextConstructor();
-      console.log('[AudioContext] Created new AudioContext');
-      console.log('[AudioContext] sampleRate (actual):', audioContext.sampleRate);
-      console.log('[AudioContext] state:', audioContext.state);
 
       if (audioContext.state === 'suspended') {
-        console.log('[AudioContext] Resuming suspended AudioContext...');
         await audioContext.resume();
-        console.log('[AudioContext] state after resume:', audioContext.state);
       }
       preloadState.value.audioContextLoaded = true;
     } else {
-      console.log('[Broadcast] 复用已预加载的 AudioContext');
-      console.log('[AudioContext] sampleRate:', audioContext.sampleRate);
-      console.log('[AudioContext] state:', audioContext.state);
-
       if (audioContext.state === 'suspended') {
         await audioContext.resume();
-        console.log('[AudioContext] 已恢复到运行状态');
       }
     }
 
-    // broadcast-manager 使用 snake_case 参数格式
-    const sampleRateParam = `&sample_rate=${audioContext.sampleRate}`;
-    const channelsParam = `&channels=1`;
-    const wsUrl = `${serverUrl.value}?codec=${codec.value}${sampleRateParam}${channelsParam}`;
-    console.log('[Broadcast] Connecting to:', wsUrl);
+    // 使用 AudioContext 的实际硬件采样率
+    targetSampleRate = audioContext.sampleRate;
+    broadcastLogger.info(`采样率: ${targetSampleRate}Hz`);
 
-    // 关闭现有连接（如果存在）
-    if (ws.value) {
-      console.log('[Broadcast] Closing existing WebSocket connection before creating new one');
-      const oldWs = ws.value;
-      ws.value = null;
-      oldWs.close();
-    }
+    setStatus('正在启动 WebSocket 连接（Rust 后端）...');
 
-    ws.value = useWebSocket(wsUrl, {
-      autoReconnect: false,
-      maxRetries: 5,
-      onOpen: () => {
-        console.log('[WebSocket] Connected to server');
-        setStatus('服务器已连接');
-      },
-      onMessage: (data) => {
-        console.log('[WebSocket] Received message:', data);
-        if (typeof data === 'string') {
-          if (data === 'ready') {
-            console.log('[WebSocket] Ready signal received, sending start_broadcast');
-            // 发送开始广播命令（broadcast-manager 协议）
-            if (ws.value) {
-              ws.value.send('start_broadcast');
-            }
-          } else if (data === 'broadcasting') {
-            // 收到广播确认后才开始音频处理（broadcast-manager 协议）
-            console.log('[WebSocket] Broadcasting confirmed');
-            if (!stream) {
-              throw new Error('MediaStream is null');
-            }
-            startAudioProcessing(stream);
-            isBroadcasting.value = true;
-            isConnecting.value = false;
-            startBroadcastTimer();
-            setStatus('广播中...');
-            stopBusyTimer();
-          } else if (data === 'idle') {
-            // broadcast-manager 广播结束状态
-            console.log('[WebSocket] Broadcast idle');
-            setStatus('已停止');
-          } else if (data.startsWith('busy|')) {
-            console.log('[WebSocket] Busy signal received');
-            const duration = parseFloat(data.split('|')[1]);
-            busyDuration.value = duration;
-            setStatus('广播被占用');
-            startBusyTimer();
-            isConnecting.value = false;
-            ElMessage.error('广播被占用，请稍后再试');
-          } else if (data.startsWith('error:')) {
-            console.error('[WebSocket] Error received:', data);
-            const errorMsg = data.split(':', 2)[1];
-            setStatus('错误: ' + errorMsg);
-            ElMessage.error(errorMsg);
-            isConnecting.value = false;
-          }
-        }
-      },
-      onClose: () => {
-        console.log('[WebSocket] Connection closed');
-        if (isBroadcasting.value) {
-          setStatus('连接断开');
-          stopBroadcast();
-        }
-      },
-      onError: (err) => {
-        console.error('[WebSocket] Error:', err);
-        setStatus('连接错误: ' + err);
-        isConnecting.value = false;
-      }
+    const baseUrl = serverUrl.value.replace(/\/ws$/, '');
+
+    await invoke('ws_start_broadcast', {
+      serverUrl: baseUrl,
+      codec: codec.value,
+      sampleRate: targetSampleRate,
+      channels: 1
     });
+
+    setStatus('等待服务器确认...');
+
   } catch (err: any) {
-    console.error('Microphone access failed', err);
-    setStatus('麦克风错误: ' + err.message);
-    ElMessage.error('无法访问麦克风');
+    broadcastLogger.error(`广播失败: ${err}`);
+    const errorMsg = '广播失败: ' + err;
+    setStatus(errorMsg);
+    ElMessage.error('启动广播失败: ' + err);
 
     if (stream) {
       stream.getTracks().forEach(track => track.stop());
-      console.log('[Broadcast] MediaStream released due to error');
       stream = null;
     }
 
     isConnecting.value = false;
-  } finally {
     isOperating.value = false;
+
+    setTimeout(() => {
+      setStatus('准备就绪');
+    }, 3000);
   }
 };
 
+// 开始音频处理（当收到 ws-broadcasting 事件时调用）
 const startAudioProcessing = async (stream: MediaStream) => {
   try {
     if (!audioContext) {
       throw new Error('AudioContext not initialized');
     }
 
-    console.log('[AudioProcessor] Using audioContext with sampleRate:', audioContext.sampleRate);
-
     if (processor) {
-      console.log('[AudioProcessor] Cleaning up old processor...');
       processor.disconnect();
-      try {
-        processor.port.close();
-        console.log('[AudioProcessor] Old processor port closed');
-      } catch (err) {
-        console.warn('[AudioProcessor] Error closing old processor port:', err);
-      }
+      try { processor.port.close(); } catch (e) { /* ignore */ }
       processor = null;
     }
 
@@ -738,121 +642,82 @@ const startAudioProcessing = async (stream: MediaStream) => {
 
     audioSource = audioContext.createMediaStreamSource(stream);
     gainNode = audioContext.createGain();
-    // 音量只在 processor 中应用，移除这里的重复设置
     audioSource.connect(gainNode);
 
-    if (!preloadState.value.audioWorkletLoaded) {
-      console.log('[AudioProcessor] AudioWorklet 未预加载，立即加载...');
-      await audioContext.audioWorklet.addModule('/src/audio-processor.ts');
-      preloadState.value.audioWorkletLoaded = true;
-    } else {
-      console.log('[AudioProcessor] 复用已预加载的 AudioWorklet 模块');
-    }
+    const moduleUrl = `/src/audio-processor.ts?t=${Date.now()}`;
+    await audioContext.audioWorklet.addModule(moduleUrl);
+    preloadState.value.audioWorkletLoaded = true;
 
     processor = new AudioWorkletNode(audioContext, 'audio-processor');
 
-    // 保存消息处理器引用，便于后续清理
     const messageHandler = (event: MessageEvent) => {
       const chunk = event.data.chunk;
-      const sampleRate = event.data.sampleRate;
-      const frameSize = event.data.frameSize;
-      console.log('[App] Received chunk from processor:',
-                  'size=', chunk.byteLength,
-                  'sampleRate=', sampleRate,
-                  'frameSize=', frameSize);
-
-      if (ws.value && ws.value.status() === 'open') {
-        ws.value.send(chunk);
-      } else {
-        console.warn('[App] WebSocket not ready, dropping chunk');
-      }
+      invoke('ws_send_audio', { data: Array.from(new Uint8Array(chunk)) })
+        .catch(err => logger.error(`发送音频数据失败: ${err}`));
     };
     processor.port.onmessage = messageHandler;
-    // 保存处理器引用用于清理
     (processor as any)._messageHandler = messageHandler;
 
     processor.port.postMessage({
       codec: codec.value,
-      sampleRate: audioContext.sampleRate,
+      sampleRate: targetSampleRate,
       volume: volume.value
     });
 
     gainNode.connect(processor);
 
-    console.log('[App] Audio processing started successfully');
+    isBroadcasting.value = true;
+    isConnecting.value = false;
+    startBroadcastTimer();
+    setStatus('广播中...');
   } catch (err) {
-    console.error('Failed to start audio processing', err);
+    audioLogger.error(`启动音频处理失败: ${err}`);
     setStatus('音频处理失败');
     ElMessage.error('音频处理失败');
+    isConnecting.value = false;
   }
 };
 
 const stopBroadcast = async () => {
-  console.log('[Broadcast] 停止广播，关闭所有连接');
+  if (!isBroadcasting.value && !isConnecting.value) return;
+
   isBroadcasting.value = false;
+  isConnecting.value = false;
+  isOperating.value = false;
   setStatus('已停止');
   stopBroadcastTimer();
   stopBusyTimer();
 
+  try {
+    await invoke('ws_stop_broadcast');
+  } catch (err) {
+    broadcastLogger.warn(`ws_stop_broadcast 失败: ${err}`);
+  }
+
   if (stream) {
-    console.log('[Broadcast] Stopping MediaStream tracks...');
-    stream.getTracks().forEach(track => {
-      track.stop();
-      console.log('[Broadcast] Stopped track:', track.kind, track.label, 'enabled:', track.enabled);
-    });
+    stream.getTracks().forEach(track => track.stop());
     stream = null;
-    console.log('[Broadcast] MediaStream released');
   }
 
   if (gainNode) {
-    console.log('[Broadcast] Disconnecting gainNode...');
     gainNode.disconnect();
     gainNode = null;
   }
   if (audioSource) {
-    console.log('[Broadcast] Disconnecting audioSource...');
     audioSource.disconnect();
     audioSource = null;
   }
 
   if (processor) {
-    console.log('[Broadcast] Disconnecting processor...');
     processor.disconnect();
-
-    // 清理消息处理器
     const messageHandler = (processor as any)._messageHandler;
     if (messageHandler) {
       processor.port.onmessage = null;
       delete (processor as any)._messageHandler;
-      console.log('[Broadcast] Processor message handler cleaned up');
     }
-
-    try {
-      processor.port.close();
-      console.log('[Broadcast] Processor port closed');
-    } catch (err) {
-      console.warn('[Broadcast] Error closing processor port:', err);
-    }
-
+    try { processor.port.close(); } catch (e) { /* ignore */ }
     processor = null;
-    console.log('[Broadcast] Audio processor disconnected');
   }
-
-  if (ws.value) {
-    // 发送停止广播命令（broadcast-manager 协议）
-    if (ws.value.status() === 'open') {
-      console.log('[Broadcast] Sending stop_broadcast command');
-      ws.value.send('stop_broadcast');
-    }
-    ws.value.close();
-    ws.value = null;
-    console.log('[Broadcast] WebSocket closed');
-  }
-
-  console.log('[Broadcast] 保留 AudioContext 和 AudioWorklet 以供下次使用');
-
-  await new Promise(resolve => setTimeout(resolve, 100));
-  console.log('[Broadcast] Cleanup complete');
 };
 
 // 事件监听器选项常量（确保添加和移除时参数一致）
@@ -860,12 +725,10 @@ const EVENT_LISTENER_OPTIONS = { capture: true, passive: false } as const;
 
 // 组件卸载时的清理函数
 const cleanup = async () => {
-  // 停止正在进行的广播
   if (isBroadcasting.value) {
     await stopBroadcast();
   }
 
-  // 释放音频资源
   if (gainNode) {
     gainNode.disconnect();
     gainNode = null;
@@ -874,19 +737,13 @@ const cleanup = async () => {
     audioSource.disconnect();
     audioSource = null;
   }
-  // 清理 processor 的消息处理器，防止内存泄漏
   if (processor) {
     const messageHandler = (processor as any)._messageHandler;
     if (messageHandler) {
       processor.port.onmessage = null;
       delete (processor as any)._messageHandler;
-      console.log('[Cleanup] Processor message handler 已清理');
     }
-    try {
-      processor.port.close();
-    } catch (err) {
-      console.warn('[Cleanup] 关闭 processor port 时出错:', err);
-    }
+    try { processor.port.close(); } catch (e) { /* ignore */ }
     processor.disconnect();
     processor = null;
   }
@@ -894,43 +751,84 @@ const cleanup = async () => {
     await audioContext.close();
     audioContext = null;
   }
-
-  // 关闭 WebSocket 连接
-  if (ws.value) {
-    ws.value.close();
-    ws.value = null;
-  }
 };
 
 onMounted(async () => {
-  // 加载配置文件
   await loadConfigFile();
 
-  // 获取配置文件路径用于显示
   try {
     configFilePath.value = await getConfigPath();
   } catch (error) {
-    console.error('[Config] 获取配置路径失败:', error);
+    configLogger.error(`获取配置路径失败: ${error}`);
   }
 
   loadPreferences();
   await preloadAudioResources();
 
+  // 监听 Tauri 事件
+  const unlistenBroadcasting = await listen('ws-broadcasting', () => {
+    if (stream) {
+      startAudioProcessing(stream);
+    }
+  });
+  eventListeners.push(unlistenBroadcasting);
+
+  const unlistenConnected = await listen('ws-connected', () => {
+    setStatus('服务器已连接');
+  });
+  eventListeners.push(unlistenConnected);
+
+  const unlistenDisconnected = await listen('ws-disconnected', () => {
+    setStatus('连接已断开');
+    isBroadcasting.value = false;
+    isConnecting.value = false;
+  });
+  eventListeners.push(unlistenDisconnected);
+
+  const unlistenIdle = await listen('ws-idle', () => {
+    setStatus('广播已结束');
+    isBroadcasting.value = false;
+  });
+  eventListeners.push(unlistenIdle);
+
+  const unlistenError = await listen('ws-error', (event: { payload: string }) => {
+    eventLogger.error(`ws-error: ${event.payload}`);
+    setStatus('错误: ' + event.payload);
+    ElMessage.error('服务器错误: ' + event.payload);
+    isConnecting.value = false;
+    isBroadcasting.value = false;
+    isOperating.value = false;
+  });
+  eventListeners.push(unlistenError);
+
+  // 监听广播任务错误
+  const unlistenBroadcastError = await listen('broadcast-error', (event: { payload: string }) => {
+    eventLogger.error(`broadcast-error: ${event.payload}`);
+    setStatus('广播错误: ' + event.payload);
+    ElMessage.error('广播失败: ' + event.payload);
+    isConnecting.value = false;
+    isBroadcasting.value = false;
+    isOperating.value = false;  // 重置操作标志
+  });
+  eventListeners.push(unlistenBroadcastError);
+
   window.addEventListener('keydown', handleKeyDown, EVENT_LISTENER_OPTIONS);
-  window.addEventListener('keyup', handleKeyUp, EVENT_LISTENER_OPTIONS);
 });
 
 onBeforeUnmount(() => {
   // 注意：cleanup 是异步的，但 onBeforeUnmount 不保证等待
   // 我们需要确保清理操作完成
   cleanup().catch(err => {
-    console.error('[Cleanup] 清理失败:', err);
+    logger.error(`清理失败: ${err}`);
   });
   stopBroadcastTimer();
   stopBusyTimer();
+
+  // 清理 Tauri 事件监听器
+  eventListeners.forEach(unlisten => unlisten());
+
   // 使用同一常量移除事件监听器，确保参数完全匹配
   window.removeEventListener('keydown', handleKeyDown, EVENT_LISTENER_OPTIONS);
-  window.removeEventListener('keyup', handleKeyUp, EVENT_LISTENER_OPTIONS);
 });
 </script>
 
