@@ -1,6 +1,23 @@
-//! WebSocket 客户端
+//! # WebSocket 客户端模块
 //!
-//! 在 Rust 后端处理 WebSocket 连接，绕过 Tauri WebView 的限制
+//! 在 Rust 后端处理 WebSocket 连接，绕过 Tauri WebView 的限制。
+//!
+//! ## 功能
+//! - 建立与服务端的 WebSocket 连接
+//! - 发送音频数据（PCM/Opus 编码）
+//! - 处理连接状态变化
+//! - 错误恢复
+//!
+//! ## 消息协议
+//! - `ready` - 服务端就绪
+//! - `start_broadcast` - 请求开始广播
+//! - `broadcasting` - 广播已开始
+//! - `stop_broadcast` - 请求停止广播
+//! - `idle` - 广播已结束
+//! - `error:<msg>` - 错误消息
+//!
+//! ## 心跳机制
+//! 每 5 秒检查一次消息，超时时间 10 秒
 
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -171,6 +188,7 @@ impl WebSocketClientManager {
     }
 
     /// 广播任务（在后台运行）
+    #[allow(clippy::too_many_arguments)]
     async fn broadcast_task(
         app_handle: &tauri::AppHandle,
         url: &str,

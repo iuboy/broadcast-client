@@ -80,13 +80,36 @@ function createAppUpdate() {
     }
   };
 
+  // HTML 转义函数，防止 XSS 攻击
+  const escapeHtml = (text: string): string => {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  };
+
+  // 格式化更新说明，将 Markdown 转为安全的 HTML
+  const formatReleaseNotes = (notes: string | null): string => {
+    if (!notes) return '<p>暂无更新说明</p>';
+
+    // 先转义所有 HTML 特殊字符
+    const escaped = escapeHtml(notes);
+
+    // 然后应用安全的 Markdown 格式转换
+    return escaped
+      .replace(/^### (.*)$/gm, '<h4>$1</h4>')
+      .replace(/^## (.*)$/gm, '<h3>$1</h3>')
+      .replace(/^- (.*)$/gm, '<li>$1</li>')
+      .replace(/\n/g, '<br>');
+  };
+
   // Show update dialog
   const showUpdateDialog = () => {
-    const message = updateInfo.value.body || '更新内容加载中...';
+    const rawMessage = updateInfo.value.body || '更新内容加载中...';
+    const safeMessage = formatReleaseNotes(rawMessage);
 
     ElNotification({
       title: `新版本 ${updateInfo.value.version} 可用`,
-      message: message,
+      message: safeMessage,
       type: 'info',
       duration: 0,
       position: 'top-right',

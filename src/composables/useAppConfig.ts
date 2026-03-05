@@ -1,12 +1,9 @@
 /**
  * 应用配置管理
  *
- * 用于读写本地配置文件（平台特定的应用数据目录）
+ * 用于读写本地配置文件
  *
- * 配置文件路径示例：
- * - Windows: C:\Users\<用户名>\AppData\Roaming\app.iamm.broadcast-service\broadcast-client-config.json
- * - macOS: ~/Library/Application Support/app.iamm.broadcast-service/broadcast-client-config.json
- * - Linux: ~/.config/app.iamm.broadcast-service/broadcast-client-config.json
+ * 配置文件路径：~/.broadcast-service/broadcast-client-config.json
  */
 
 import { invoke } from '@tauri-apps/api/core';
@@ -17,6 +14,8 @@ import { APP_CONFIG } from '@/config';
 export interface AppConfig {
   /** WebSocket 服务器地址 */
   serverUrl: string;
+  /** 更新服务器基础地址（自动拼接 /{target}/{current_version}） */
+  updateServerBaseUrl: string;
   /** 默认编码格式 (pcm/opus) */
   defaultCodec: string;
   /** 默认音量 (0.0 - 1.5) */
@@ -27,6 +26,7 @@ export interface AppConfig {
 // 从 config.ts 导入，保持配置一致性
 const DEFAULT_CONFIG: AppConfig = {
   serverUrl: APP_CONFIG.WS_URL,
+  updateServerBaseUrl: '',
   defaultCodec: APP_CONFIG.DEFAULT_CODEC,
   defaultVolume: APP_CONFIG.DEFAULT_VOLUME,
 };

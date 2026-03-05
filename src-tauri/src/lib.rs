@@ -1,13 +1,27 @@
-//! 广播客户端 - Tauri 应用入口
+//! # 广播客户端 - Tauri 应用库
 //!
-//! 用于连接到 broadcast-manager 并推送音频数据
+//! 本模块提供 Tauri 应用的核心功能，包括：
+//!
+//! ## 主要模块
+//! - `websocket_client` - WebSocket 客户端，负责与服务端通信
+//!
+//! ## Tauri 命令
+//! - `read_config` - 读取配置文件
+//! - `write_config` - 写入配置文件
+//! - `get_config_path_str` - 获取配置文件路径
+//! - `get_update_info` - 获取更新信息
+//! - `install_update` - 安装更新
+//! - `log_to_file` - 记录日志到文件
+//! - `ws_start_broadcast` - 开始广播
+//! - `ws_stop_broadcast` - 停止广播
+//! - `ws_send_audio` - 发送音频数据
+//! - `ws_get_state` - 获取连接状态
 
 mod websocket_client;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tauri::Manager;
 use tauri_plugin_updater::UpdaterExt;
 use tracing_subscriber::prelude::*;
 
@@ -20,6 +34,9 @@ use websocket_client::{ws_start_broadcast, ws_stop_broadcast, ws_send_audio, ws_
 pub struct AppConfig {
     /// WebSocket 服务器地址
     pub server_url: String,
+    /// 更新服务器基础地址（自动拼接 /{target}/{current_version}）
+    #[serde(alias = "updateServerUrl")]  // 向后兼容旧的字段名
+    pub update_server_base_url: String,
     /// 默认编码格式 (pcm/opus)
     pub default_codec: String,
     /// 默认音量 (0.0 - 1.5)
@@ -30,6 +47,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             server_url: "ws://localhost:8081/ws".to_string(),
+            update_server_base_url: String::new(),
             default_codec: "pcm".to_string(),
             default_volume: 1.0,
         }
@@ -43,6 +61,8 @@ impl AppConfig {
         if self.server_url.is_empty() {
             return Err("服务器地址不能为空".to_string());
         }
+
+        // 更新服务器地址可以为空，空时使用 Tauri 内置 updater
 
         // 验证编码格式
         if !["pcm", "opus"].contains(&self.default_codec.as_str()) {
@@ -67,15 +87,26 @@ pub struct UpdateInfo {
     pub date: Option<String>,
 }
 
-/// 获取配置文件路径（平台特定的应用数据目录）
-fn get_config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // 获取平台特定的应用数据目录
-    let config_dir = app.path().app_data_dir()
-        .map_err(|e| format!("无法获取配置目录: {}", e))?;
+/// 获取配置文件路径（统一使用 ~/.broadcast-service/ 目录）
+fn get_config_path(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // 使用统一的配置目录 ~/.broadcast-service/
+    let config_dir = dirs::home_dir()
+        .map(|home| home.join(".broadcast-service"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".broadcast-service"));
 
-    // 确保目录存在
+    // 确保目录存在（限制权限为仅所有者可访问）
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("无法创建配置目录: {}", e))?;
+
+    // 设置目录权限为 0700（仅所有者可访问）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(mut perms) = std::fs::metadata(&config_dir).map(|m| m.permissions()) {
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(&config_dir, perms);
+        }
+    }
 
     // 返回配置文件完整路径
     Ok(config_dir.join("broadcast-client-config.json"))
@@ -95,14 +126,56 @@ fn read_config(app: tauri::AppHandle) -> Result<AppConfig, String> {
     let content = fs::read_to_string(&config_path)
         .map_err(|e| format!("无法读取配置文件: {}", e))?;
 
-    // 解析 JSON
-    let config: AppConfig = serde_json::from_str(&content)
+    // 解析 JSON，并处理旧配置的字段兼容性
+    let mut config: AppConfig = serde_json::from_str(&content)
         .map_err(|e| format!("配置文件格式错误: {}", e))?;
+
+    // 向后兼容：如果存在旧的 updateServerUrl 字段，迁移到新字段
+    if config.update_server_base_url.is_empty() {
+        // 尝试从原始 JSON 中读取旧字段
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(old_url) = raw.get("updateServerUrl").and_then(|v| v.as_str()) {
+                config.update_server_base_url = old_url.to_string();
+                // 自动保存迁移后的配置
+                let _ = write_config_internal(&config_path, &config);
+            }
+        }
+    }
 
     // 验证配置
     config.validate()?;
 
     Ok(config)
+}
+
+/// 内部函数：写入配置文件
+fn write_config_internal(config_path: &std::path::PathBuf, config: &AppConfig) -> Result<(), String> {
+    // 序列化为 JSON
+    let content = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("序列化配置失败: {}", e))?;
+
+    // 使用原子性写入：先写临时文件，然后重命名
+    let temp_path = config_path.with_extension("tmp");
+
+    // 写入临时文件
+    fs::write(&temp_path, content)
+        .map_err(|e| format!("写入临时文件失败: {}", e))?;
+
+    // 设置文件权限为 0600（仅所有者可读写）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(mut perms) = std::fs::metadata(&temp_path).map(|m| m.permissions()) {
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(&temp_path, perms);
+        }
+    }
+
+    // 原子性重命名
+    fs::rename(&temp_path, config_path)
+        .map_err(|e| format!("重命名配置文件失败: {}", e))?;
+
+    Ok(())
 }
 
 /// 写入配置文件（原子性写入）
@@ -113,22 +186,7 @@ fn write_config(app: tauri::AppHandle, config: AppConfig) -> Result<(), String> 
     // 验证配置
     config.validate()?;
 
-    // 序列化为 JSON
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("序列化配置失败: {}", e))?;
-
-    // 使用原子性写入：先写临时文件，然后重命名
-    let temp_path = config_path.with_extension("tmp");
-
-    // 写入临时文件
-    fs::write(&temp_path, content)
-        .map_err(|e| format!("写入临时文件失败: {}", e))?;
-
-    // 原子性重命名
-    fs::rename(&temp_path, &config_path)
-        .map_err(|e| format!("重命名配置文件失败: {}", e))?;
-
-    Ok(())
+    write_config_internal(&config_path, &config)
 }
 
 /// 获取配置文件路径（用于调试）
@@ -141,16 +199,100 @@ fn get_config_path_str(app: tauri::AppHandle) -> Result<String, String> {
 /// 获取更新信息
 #[tauri::command]
 async fn get_update_info(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    if let Some(res) = updater.check().await.map_err(|e| e.to_string())? {
-        let date = res.date.map(|d| d.to_string());
+    // 从配置读取更新服务器基础地址
+    let config_path = get_config_path(&app)?;
+    let update_server_base_url = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .map_err(|e| format!("无法读取配置文件: {}", e))?;
+        let config: AppConfig = serde_json::from_str(&content)
+            .map_err(|e| format!("配置文件格式错误: {}", e))?;
+        config.update_server_base_url
+    } else {
+        String::new()
+    };
+
+    // 检查是否使用默认（未配置）的更新服务器
+    if update_server_base_url.is_empty() {
+        // 使用 Tauri 内置的 updater 插件
+        let updater = app.updater().map_err(|e| e.to_string())?;
+        if let Some(res) = updater.check().await.map_err(|e| e.to_string())? {
+            let date = res.date.map(|d| d.to_string());
+            return Ok(UpdateInfo {
+                available: true,
+                version: Some(res.version.clone()),
+                body: res.body.clone(),
+                date,
+            });
+        }
+        return Ok(UpdateInfo {
+            available: false,
+            version: None,
+            body: None,
+            date: None,
+        });
+    }
+
+    // 使用自定义更新服务器
+    // 获取当前平台和版本
+    let target = if cfg!(target_os = "windows") {
+        "windows-x86_64"
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "darwin-aarch64"
+        } else {
+            "darwin-x86_64"
+        }
+    } else if cfg!(target_os = "linux") {
+        "linux-x86_64"
+    } else {
+        return Err("不支持的平台".to_string());
+    };
+
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    // 自动拼接 URL：基础地址 + "/" + target + "/" + current_version
+    let url = if update_server_base_url.ends_with('/') {
+        format!("{}{}/{}", update_server_base_url, target, current_version)
+    } else {
+        format!("{}/{}/{}", update_server_base_url, target, current_version)
+    };
+
+    tracing::info!("使用自定义更新服务器: {}", url);
+
+    // 发起 HTTP 请求（连接超时 10 秒，总超时 30 秒）
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+
+    let response = client.get(&url).send().await
+        .map_err(|e| format!("请求更新服务器失败（连接超时或网络错误）: {}", e))?;
+
+    if response.status().is_success() {
+        // 假设返回的是 JSON 格式的更新信息
+        #[derive(serde::Deserialize)]
+        struct UpdateResponse {
+            version: String,
+            body: Option<String>,
+            date: Option<String>,
+            #[allow(dead_code)]
+            url: Option<String>,
+        }
+
+        let update_info: UpdateResponse = response.json().await.map_err(|e| format!("解析更新信息失败: {}", e))?;
+
+        // 比较版本号
+        let available = update_info.version != current_version;
+
         Ok(UpdateInfo {
-            available: true,
-            version: Some(res.version.clone()),
-            body: res.body.clone(),
-            date,
+            available,
+            version: Some(update_info.version),
+            body: update_info.body,
+            date: update_info.date,
         })
     } else {
+        tracing::warn!("更新服务器返回错误: {}", response.status());
         Ok(UpdateInfo {
             available: false,
             version: None,
@@ -163,6 +305,24 @@ async fn get_update_info(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
 /// 安装更新
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
+    // 检查是否使用自定义更新服务器
+    let config_path = get_config_path(&app)?;
+    let update_server_base_url = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .map_err(|e| format!("无法读取配置文件: {}", e))?;
+        let config: AppConfig = serde_json::from_str(&content)
+            .map_err(|e| format!("配置文件格式错误: {}", e))?;
+        config.update_server_base_url
+    } else {
+        String::new()
+    };
+
+    // 如果配置了自定义更新服务器，提示用户手动下载
+    if !update_server_base_url.is_empty() {
+        return Err("使用自定义更新服务器时，请手动下载更新包。\n\n请联系管理员获取最新版本。".to_string());
+    }
+
+    // 使用 Tauri 内置的 updater 插件
     let updater = app.updater().map_err(|e| e.to_string())?;
     if let Some(res) = updater.check().await.map_err(|e| e.to_string())? {
         res.download_and_install(
@@ -191,7 +351,7 @@ fn log_to_file(level: String, tag: String, message: String) {
 pub fn run() {
     // 初始化日志系统 - 同时输出到控制台和文件
     let log_dir = dirs::home_dir()
-        .map(|home| home.join(".broadcast-client").join("logs"))
+        .map(|home| home.join(".broadcast-service").join("logs"))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     // 确保日志目录存在
@@ -235,6 +395,38 @@ pub fn run() {
 
     tracing::info!("广播客户端启动中...");
     tracing::info!("日志文件: {:?}", log_path);
+
+    // 启动日志清理任务（保留最近 7 天的日志）
+    let log_dir_clone = log_dir.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // 每小时检查一次
+        loop {
+            interval.tick().await;
+            if let Ok(entries) = std::fs::read_dir(&log_dir_clone) {
+                let now = std::time::SystemTime::now();
+                let max_age = std::time::Duration::from_secs(7 * 24 * 3600); // 7 天
+
+                for entry in entries.filter_map(Result::ok) {
+                    if let Ok(metadata) = entry.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Ok(age) = now.duration_since(modified) {
+                                if age > max_age {
+                                    let path = entry.path();
+                                    let path_str = path.to_string_lossy();
+                                    // 只删除 .log 或 .log.* 文件
+                                    if path.extension().map(|s| s.to_string_lossy()).unwrap_or_default() == "log" ||
+                                       path_str.ends_with(".log") {
+                                        let _ = std::fs::remove_file(&path);
+                                        tracing::info!("清理过期日志文件: {:?}", path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // 保留 _guard 以防止文件日志过早关闭
     std::mem::forget(_guard);

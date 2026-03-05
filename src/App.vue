@@ -1,3 +1,14 @@
+<!--
+  广播客户端主界面
+
+  功能：
+  - 按住说话模式（空格键或按钮）
+  - 编码格式选择（PCM/Opus）
+  - 音量调节
+  - 连接状态显示
+  - 配置管理
+  - 自动更新检测
+-->
 <template>
   <div class="app-container">
     <!-- Header -->
@@ -95,7 +106,11 @@
           class="broadcast-btn"
           :class="{ broadcasting: isBroadcasting }"
           :disabled="(connectionStatus === 'busy' || connectionStatus === 'connecting') && !isBroadcasting"
-          @click="toggleBroadcast"
+          @mousedown="handleMouseDown"
+          @mouseup="handleMouseUp"
+          @mouseleave="handleMouseUp"
+          @touchstart.prevent="handleTouchStart"
+          @touchend.prevent="handleTouchEnd"
         >
           <template v-if="connectionStatus === 'busy' && !isBroadcasting">
             <span class="btn-icon">🚫</span>
@@ -107,11 +122,11 @@
           </template>
           <template v-else-if="!isBroadcasting">
             <span class="btn-icon">🎙️</span>
-            <span>点击说话</span>
+            <span>按住说话</span>
           </template>
           <template v-else>
             <span class="btn-icon">🔴</span>
-            <span>点击停止</span>
+            <span>松开停止</span>
           </template>
         </button>
 
@@ -121,14 +136,14 @@
           <span class="timer-text">{{ formatTime(broadcastDuration) }}</span>
         </div>
         <div v-else class="hints-section">
-          点击按钮开始广播
+          按住按钮或空格键开始广播
         </div>
       </div>
     </main>
 
     <!-- Footer -->
     <footer class="app-footer">
-      <span class="version">v1.0.0</span>
+      <span class="version">v{{ appVersion }}</span>
     </footer>
 
     <!-- Update Dialog -->
@@ -147,7 +162,7 @@
           <div class="update-info">
             <div class="info-item">
               <span class="info-label">当前版本:</span>
-              <span class="info-value">1.0.0</span>
+              <span class="info-value">{{ appVersion }}</span>
             </div>
             <div class="info-item">
               <span class="info-label">新版本:</span>
@@ -199,20 +214,36 @@
       title="设置"
       width="450px"
     >
-      <el-form :model="settingsForm" label-width="100px">
-        <el-form-item label="服务器地址">
+      <el-form
+        ref="settingsFormRef"
+        :model="settingsForm"
+        :rules="settingsFormRules"
+        label-width="120px"
+      >
+        <el-form-item label="广播服务器地址" prop="serverUrl">
           <el-input
             v-model="settingsForm.serverUrl"
             placeholder="ws://localhost:8081/ws"
+            clearable
           />
         </el-form-item>
-        <el-form-item label="默认编码">
-          <el-select v-model="settingsForm.defaultCodec">
+        <el-form-item label="更新服务器地址" prop="updateServerBaseUrl">
+          <el-input
+            v-model="settingsForm.updateServerBaseUrl"
+            placeholder="https://example.com/updates（留空使用默认）"
+            clearable
+          />
+          <div class="form-item-hint" v-if="settingsForm.updateServerBaseUrl">
+            程序会自动在地址后拼接 /平台/版本号，如: /windows-x86_64/0.1.0
+          </div>
+        </el-form-item>
+        <el-form-item label="默认编码" prop="defaultCodec">
+          <el-select v-model="settingsForm.defaultCodec" style="width: 100%">
             <el-option label="PCM（最低延迟）" value="pcm" />
             <el-option label="Opus（省流量）" value="opus" />
           </el-select>
         </el-form-item>
-        <el-form-item label="默认音量">
+        <el-form-item label="默认音量" prop="defaultVolume">
           <el-slider
             v-model="settingsForm.defaultVolume"
             :min="0"
@@ -241,6 +272,7 @@ import { ref, computed, onBeforeUnmount, onMounted, watch, reactive } from 'vue'
 import { ElMessage, ElNotification } from 'element-plus';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getVersion } from '@tauri-apps/api/app';
 import { useAppUpdate } from '@/utils/useAppUpdate';
 import { APP_CONFIG } from '@/config';
 import { readConfig, writeConfig, getConfigPath, type AppConfig } from '@/composables';
@@ -259,13 +291,115 @@ const serverUrl = ref(APP_CONFIG.WS_URL);
 const updateDialogVisible = ref(false);
 const settingsDialogVisible = ref(false);
 const configFilePath = ref('');
+const settingsFormRef = ref();
+const appVersion = ref('加载中...');
+
+// 验证函数（必须在 settingsFormRules 之前定义）
+// URL 验证函数
+const isValidWebSocketUrl = (url: string): boolean => {
+  try {
+    // 必须是有效的 URL
+    const parsed = new URL(url);
+
+    // 只允许 ws:// 或 wss:// 协议
+    if (!['ws:', 'wss:'].includes(parsed.protocol)) {
+      return false;
+    }
+
+    // 必须有主机名
+    if (!parsed.hostname || parsed.hostname.trim() === '') {
+      return false;
+    }
+
+    // 拒绝 localhost 以外的本地地址（防止内网探测）
+    const hostname = parsed.hostname.toLowerCase();
+    const localPatterns = ['127.0.0.1', 'localhost', '[::1]'];
+    if (!localPatterns.includes(hostname) &&
+        (hostname === '0.0.0.0' || hostname.startsWith('192.168.') ||
+         hostname.startsWith('10.') || hostname.startsWith('172.'))) {
+      // 允许私有网络地址（本地部署场景）
+      // 但可以记录警告
+      console.warn(`连接到私有网络地址: ${hostname}`);
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const isValidHttpsUrl = (url: string): boolean => {
+  if (!url.trim()) return true; // 允许为空
+  try {
+    const parsed = new URL(url);
+    return ['https:', 'http:'].includes(parsed.protocol) &&
+           parsed.hostname.trim() !== '';
+  } catch {
+    return false;
+  }
+};
 
 // 设置表单
 const settingsForm = reactive<AppConfig>({
   serverUrl: 'ws://localhost:8081/ws',
+  updateServerBaseUrl: '',
   defaultCodec: 'pcm',
   defaultVolume: 1.0,
 });
+
+// 表单验证规则
+const settingsFormRules = {
+  serverUrl: [
+    { required: true, message: '广播服务器地址不能为空', trigger: 'blur' },
+    {
+      validator: (_rule: any, value: string, callback: any) => {
+        if (!value || isValidWebSocketUrl(value)) {
+          callback();
+        } else {
+          callback(new Error('请输入有效的 WebSocket 地址（ws:// 或 wss://）'));
+        }
+      },
+      trigger: 'blur'
+    }
+  ],
+  updateServerBaseUrl: [
+    {
+      validator: (_rule: any, value: string, callback: any) => {
+        if (!value || isValidHttpsUrl(value)) {
+          callback();
+        } else {
+          callback(new Error('请输入有效的 HTTP/HTTPS 地址'));
+        }
+      },
+      trigger: 'blur'
+    }
+  ],
+  defaultCodec: [
+    { required: true, message: '请选择默认编码', trigger: 'change' },
+    {
+      validator: (_rule: any, value: string, callback: any) => {
+        if (['pcm', 'opus'].includes(value)) {
+          callback();
+        } else {
+          callback(new Error('编码格式必须是 PCM 或 Opus'));
+        }
+      },
+      trigger: 'change'
+    }
+  ],
+  defaultVolume: [
+    {
+      validator: (_rule: any, value: number, callback: any) => {
+        if (value >= 0 && value <= 1.5) {
+          callback();
+        } else {
+          callback(new Error('音量必须在 0% 到 150% 之间'));
+        }
+      },
+      trigger: 'change'
+    }
+  ]
+};
 
 // Initialize update functionality
 const {
@@ -334,6 +468,7 @@ const loadConfigFile = async () => {
     const config = await readConfig();
     serverUrl.value = config.serverUrl;
     settingsForm.serverUrl = config.serverUrl;
+    settingsForm.updateServerBaseUrl = config.updateServerBaseUrl;
     settingsForm.defaultCodec = config.defaultCodec;
     settingsForm.defaultVolume = config.defaultVolume;
   } catch (error) {
@@ -347,6 +482,7 @@ const showSettingsDialog = async () => {
   try {
     const config = await readConfig();
     settingsForm.serverUrl = config.serverUrl;
+    settingsForm.updateServerBaseUrl = config.updateServerBaseUrl;
     settingsForm.defaultCodec = config.defaultCodec;
     settingsForm.defaultVolume = config.defaultVolume;
   } catch (error) {
@@ -355,8 +491,16 @@ const showSettingsDialog = async () => {
   settingsDialogVisible.value = true;
 };
 
-// Save settings
+// 保存设置
 const saveSettings = async () => {
+  // 使用表单验证
+  try {
+    await settingsFormRef.value?.validate();
+  } catch (error) {
+    // 验证失败，不继续保存
+    return;
+  }
+
   try {
     await writeConfig(settingsForm);
     serverUrl.value = settingsForm.serverUrl;
@@ -419,13 +563,33 @@ const preloadAudioResources = async () => {
   preloadState.value.isPreloading = false;
 };
 
+// 防抖函数：延迟执行 func，如果在 delay 时间内再次调用则重置计时器
+function debounce<T extends (...args: any[]) => void>(func: T, delay: number): (...args: Parameters<T>) => void {
+  let timeoutId: number | null = null;
+  return (...args: Parameters<T>) => {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+    timeoutId = setTimeout(() => {
+      func(...args);
+      timeoutId = null;
+    }, delay);
+  };
+}
+
 // Save preferences
 const saveCodecPreference = () => {
   localStorage.setItem('broadcast-codec', codec.value);
 };
 
-const saveVolumePreference = () => {
+// 使用防抖的音量保存函数（300ms 延迟）
+const saveVolumePreferenceDebounced = debounce(() => {
   localStorage.setItem('broadcast-volume', volume.value.toString());
+}, 300);
+
+// 保存音量偏好（使用防抖版本）
+const saveVolumePreference = () => {
+  saveVolumePreferenceDebounced();
 };
 
 // Connection status
@@ -491,22 +655,44 @@ const formatReleaseNotes = (notes: string | null) => {
     .replace(/\n/g, '<br>');
 };
 
-// 切换广播状态（点击按钮）
-const toggleBroadcast = async () => {
-  if (isBroadcasting.value) {
-    // 如果正在广播，则停止
-    stopBroadcast();
-  } else {
-    // 如果没有广播，则开始
+// 按钮鼠标事件处理 - 按住说话
+const handleMouseDown = async () => {
+  if (!isBroadcasting.value) {
     await startBroadcast();
   }
 };
 
-// Keyboard handler - 空格键切换广播
+const handleMouseUp = () => {
+  if (isBroadcasting.value) {
+    stopBroadcast();
+  }
+};
+
+// 触摸事件处理（移动端）
+const handleTouchStart = async () => {
+  if (!isBroadcasting.value) {
+    await startBroadcast();
+  }
+};
+
+const handleTouchEnd = () => {
+  if (isBroadcasting.value) {
+    stopBroadcast();
+  }
+};
+
+// Keyboard handler - 空格键按住说话
 const handleKeyDown = async (e: KeyboardEvent) => {
-  if (e.code === 'Space' && !e.repeat) {
+  if (e.code === 'Space' && !e.repeat && !isBroadcasting.value) {
     e.preventDefault();
-    await toggleBroadcast();
+    await startBroadcast();
+  }
+};
+
+const handleKeyUp = (e: KeyboardEvent) => {
+  if (e.code === 'Space' && isBroadcasting.value) {
+    e.preventDefault();
+    stopBroadcast();
   }
 };
 
@@ -587,7 +773,17 @@ const startBroadcast = async () => {
 
     setStatus('正在启动 WebSocket 连接（Rust 后端）...');
 
+    // 验证服务器 URL
     const baseUrl = serverUrl.value.replace(/\/ws$/, '');
+    if (!isValidWebSocketUrl(baseUrl)) {
+      const errorMsg = '无效的服务器地址，请检查配置';
+      broadcastLogger.error(`URL 验证失败: ${baseUrl}`);
+      setStatus(errorMsg);
+      ElMessage.error('服务器地址格式错误，请使用 ws:// 或 wss:// 开头的有效地址');
+      isConnecting.value = false;
+      isOperating.value = false;
+      return;
+    }
 
     await invoke('ws_start_broadcast', {
       serverUrl: baseUrl,
@@ -694,29 +890,49 @@ const stopBroadcast = async () => {
     broadcastLogger.warn(`ws_stop_broadcast 失败: ${err}`);
   }
 
-  if (stream) {
-    stream.getTracks().forEach(track => track.stop());
-    stream = null;
-  }
-
-  if (gainNode) {
-    gainNode.disconnect();
-    gainNode = null;
-  }
-  if (audioSource) {
-    audioSource.disconnect();
-    audioSource = null;
-  }
-
-  if (processor) {
-    processor.disconnect();
-    const messageHandler = (processor as any)._messageHandler;
-    if (messageHandler) {
-      processor.port.onmessage = null;
-      delete (processor as any)._messageHandler;
+  // 确保资源总是被清理，无论 ws_stop_broadcast 是否成功
+  try {
+    if (stream) {
+      stream.getTracks().forEach(track => {
+        try { track.stop(); } catch (e) {
+          broadcastLogger.warn(`停止音频轨道失败: ${e}`);
+        }
+      });
+      stream = null;
     }
-    try { processor.port.close(); } catch (e) { /* ignore */ }
-    processor = null;
+
+    if (gainNode) {
+      try { gainNode.disconnect(); } catch (e) {
+        broadcastLogger.warn(`断开 gainNode 失败: ${e}`);
+      }
+      gainNode = null;
+    }
+
+    if (audioSource) {
+      try { audioSource.disconnect(); } catch (e) {
+        broadcastLogger.warn(`断开 audioSource 失败: ${e}`);
+      }
+      audioSource = null;
+    }
+
+    if (processor) {
+      try {
+        const messageHandler = (processor as any)._messageHandler;
+        if (messageHandler) {
+          processor.port.onmessage = null;
+          delete (processor as any)._messageHandler;
+        }
+        processor.port.close();
+      } catch (e) {
+        broadcastLogger.warn(`关闭 processor port 失败: ${e}`);
+      }
+      try { processor.disconnect(); } catch (e) {
+        broadcastLogger.warn(`断开 processor 失败: ${e}`);
+      }
+      processor = null;
+    }
+  } catch (cleanupError) {
+    broadcastLogger.error(`资源清理过程中发生错误: ${cleanupError}`);
   }
 };
 
@@ -754,6 +970,14 @@ const cleanup = async () => {
 };
 
 onMounted(async () => {
+  // 获取应用版本号
+  try {
+    appVersion.value = await getVersion();
+  } catch (error) {
+    logger.warn(`获取应用版本失败: ${error}`);
+    appVersion.value = '未知版本';
+  }
+
   await loadConfigFile();
 
   try {
@@ -813,6 +1037,7 @@ onMounted(async () => {
   eventListeners.push(unlistenBroadcastError);
 
   window.addEventListener('keydown', handleKeyDown, EVENT_LISTENER_OPTIONS);
+  window.addEventListener('keyup', handleKeyUp, EVENT_LISTENER_OPTIONS);
 });
 
 onBeforeUnmount(() => {
@@ -829,6 +1054,7 @@ onBeforeUnmount(() => {
 
   // 使用同一常量移除事件监听器，确保参数完全匹配
   window.removeEventListener('keydown', handleKeyDown, EVENT_LISTENER_OPTIONS);
+  window.removeEventListener('keyup', handleKeyUp, EVENT_LISTENER_OPTIONS);
 });
 </script>
 
@@ -1322,5 +1548,11 @@ body {
 :deep(.el-form-item__label) {
   color: #6b7280;
   font-weight: 500;
+}
+
+.form-item-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #9ca3af;
 }
 </style>
