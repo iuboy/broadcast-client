@@ -431,6 +431,7 @@ let broadcastTimer: number | null = null;
 let busyTimer: number | null = null;
 const maxBroadcastTime = 5 * 60;
 let targetSampleRate = 0; // 将从 AudioContext 获取实际硬件采样率
+let workletBlobUrl: string | null = null; // 跟踪 AudioWorklet Blob URL 用于清理
 
 // Tauri 事件监听器清理函数
 const eventListeners: Array<() => void> = [];
@@ -814,6 +815,61 @@ const startBroadcast = async () => {
   }
 };
 
+// AudioWorklet 处理器代码（转换为 Blob URL 以避免路径问题）
+const getAudioWorkletBlobUrl = (): string => {
+  const workletCode = `
+class AudioProcessor extends globalThis.AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.sampleRate = options.sampleRate;
+    this.volume = 1.0;
+    this.frameSize = 1024;
+    this.sampleBuffer = new Int16Array(this.frameSize);
+    this.bufferOffset = 0;
+
+    this.port.onmessage = (event) => {
+      if (event.data.volume !== undefined) {
+        this.volume = event.data.volume;
+      }
+    };
+  }
+
+  process(inputList) {
+    const input = inputList[0];
+    if (input.length === 0) return true;
+
+    const inputData = input[0];
+    for (let i = 0; i < inputData.length; i++) {
+      let sample = inputData[i] * this.volume;
+      if (Math.abs(sample) > 1.0) sample = Math.tanh(sample);
+      this.sampleBuffer[this.bufferOffset++] = Math.max(-32768, Math.min(32767, Math.round(sample * 0x7FFF)));
+
+      if (this.bufferOffset >= this.frameSize) {
+        this.sendFrame();
+        this.bufferOffset = 0;
+      }
+    }
+    return true;
+  }
+
+  sendFrame() {
+    if (!this.port) return;
+
+    const chunk = new ArrayBuffer(this.frameSize * 2);
+    const view = new DataView(chunk);
+    for (let i = 0; i < this.frameSize; i++) {
+      view.setInt16(i * 2, this.sampleBuffer[i], true);
+    }
+    this.port.postMessage({ chunk, sampleRate: this.sampleRate }, [chunk]);
+  }
+}
+
+registerProcessor('audio-processor', AudioProcessor);
+`;
+  const blob = new Blob([workletCode], { type: 'application/javascript' });
+  return URL.createObjectURL(blob);
+};
+
 // 开始音频处理（当收到 ws-broadcasting 事件时调用）
 const startAudioProcessing = async (stream: MediaStream) => {
   try {
@@ -840,8 +896,9 @@ const startAudioProcessing = async (stream: MediaStream) => {
     gainNode = audioContext.createGain();
     audioSource.connect(gainNode);
 
-    const moduleUrl = `/src/audio-processor.ts?t=${Date.now()}`;
-    await audioContext.audioWorklet.addModule(moduleUrl);
+    // 使用 Blob URL 加载 AudioWorklet，避免路径和 CORS 问题
+    workletBlobUrl = getAudioWorkletBlobUrl();
+    await audioContext.audioWorklet.addModule(workletBlobUrl);
     preloadState.value.audioWorkletLoaded = true;
 
     processor = new AudioWorkletNode(audioContext, 'audio-processor');
@@ -931,6 +988,14 @@ const stopBroadcast = async () => {
       }
       processor = null;
     }
+
+    // 释放 Blob URL 以避免内存泄漏
+    if (workletBlobUrl) {
+      try { URL.revokeObjectURL(workletBlobUrl); } catch (e) {
+        broadcastLogger.warn(`释放 Blob URL 失败: ${e}`);
+      }
+      workletBlobUrl = null;
+    }
   } catch (cleanupError) {
     broadcastLogger.error(`资源清理过程中发生错误: ${cleanupError}`);
   }
@@ -963,6 +1028,13 @@ const cleanup = async () => {
     processor.disconnect();
     processor = null;
   }
+
+  // 释放 Blob URL 以避免内存泄漏
+  if (workletBlobUrl) {
+    try { URL.revokeObjectURL(workletBlobUrl); } catch (e) { /* ignore */ }
+    workletBlobUrl = null;
+  }
+
   if (audioContext) {
     await audioContext.close();
     audioContext = null;

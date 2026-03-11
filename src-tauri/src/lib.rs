@@ -26,7 +26,7 @@ use tauri_plugin_updater::UpdaterExt;
 use tracing_subscriber::prelude::*;
 
 // 导出 WebSocket 客户端命令
-use websocket_client::{ws_start_broadcast, ws_stop_broadcast, ws_send_audio, ws_get_state};
+use websocket_client::{ws_get_state, ws_send_audio, ws_start_broadcast, ws_stop_broadcast};
 
 /// 配置文件结构
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,7 +35,7 @@ pub struct AppConfig {
     /// WebSocket 服务器地址
     pub server_url: String,
     /// 更新服务器基础地址（自动拼接 /{target}/{current_version}）
-    #[serde(alias = "updateServerUrl")]  // 向后兼容旧的字段名
+    #[serde(alias = "updateServerUrl")] // 向后兼容旧的字段名
     pub update_server_base_url: String,
     /// 默认编码格式 (pcm/opus)
     pub default_codec: String,
@@ -95,8 +95,7 @@ fn get_config_path(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .unwrap_or_else(|| std::path::PathBuf::from(".broadcast-service"));
 
     // 确保目录存在（限制权限为仅所有者可访问）
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("无法创建配置目录: {}", e))?;
+    std::fs::create_dir_all(&config_dir).map_err(|e| format!("无法创建配置目录: {}", e))?;
 
     // 设置目录权限为 0700（仅所有者可访问）
     #[cfg(unix)]
@@ -123,12 +122,12 @@ fn read_config(app: tauri::AppHandle) -> Result<AppConfig, String> {
     }
 
     // 读取配置文件
-    let content = fs::read_to_string(&config_path)
-        .map_err(|e| format!("无法读取配置文件: {}", e))?;
+    let content =
+        fs::read_to_string(&config_path).map_err(|e| format!("无法读取配置文件: {}", e))?;
 
     // 解析 JSON，并处理旧配置的字段兼容性
-    let mut config: AppConfig = serde_json::from_str(&content)
-        .map_err(|e| format!("配置文件格式错误: {}", e))?;
+    let mut config: AppConfig =
+        serde_json::from_str(&content).map_err(|e| format!("配置文件格式错误: {}", e))?;
 
     // 向后兼容：如果存在旧的 updateServerUrl 字段，迁移到新字段
     if config.update_server_base_url.is_empty() {
@@ -149,17 +148,19 @@ fn read_config(app: tauri::AppHandle) -> Result<AppConfig, String> {
 }
 
 /// 内部函数：写入配置文件
-fn write_config_internal(config_path: &std::path::PathBuf, config: &AppConfig) -> Result<(), String> {
+fn write_config_internal(
+    config_path: &std::path::PathBuf,
+    config: &AppConfig,
+) -> Result<(), String> {
     // 序列化为 JSON
-    let content = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("序列化配置失败: {}", e))?;
+    let content =
+        serde_json::to_string_pretty(config).map_err(|e| format!("序列化配置失败: {}", e))?;
 
     // 使用原子性写入：先写临时文件，然后重命名
     let temp_path = config_path.with_extension("tmp");
 
     // 写入临时文件
-    fs::write(&temp_path, content)
-        .map_err(|e| format!("写入临时文件失败: {}", e))?;
+    fs::write(&temp_path, content).map_err(|e| format!("写入临时文件失败: {}", e))?;
 
     // 设置文件权限为 0600（仅所有者可读写）
     #[cfg(unix)]
@@ -172,8 +173,7 @@ fn write_config_internal(config_path: &std::path::PathBuf, config: &AppConfig) -
     }
 
     // 原子性重命名
-    fs::rename(&temp_path, config_path)
-        .map_err(|e| format!("重命名配置文件失败: {}", e))?;
+    fs::rename(&temp_path, config_path).map_err(|e| format!("重命名配置文件失败: {}", e))?;
 
     Ok(())
 }
@@ -192,8 +192,7 @@ fn write_config(app: tauri::AppHandle, config: AppConfig) -> Result<(), String> 
 /// 获取配置文件路径（用于调试）
 #[tauri::command]
 fn get_config_path_str(app: tauri::AppHandle) -> Result<String, String> {
-    get_config_path(&app)
-        .map(|p| p.to_string_lossy().to_string())
+    get_config_path(&app).map(|p| p.to_string_lossy().to_string())
 }
 
 /// 获取更新信息
@@ -202,10 +201,10 @@ async fn get_update_info(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
     // 从配置读取更新服务器基础地址
     let config_path = get_config_path(&app)?;
     let update_server_base_url = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .map_err(|e| format!("无法读取配置文件: {}", e))?;
-        let config: AppConfig = serde_json::from_str(&content)
-            .map_err(|e| format!("配置文件格式错误: {}", e))?;
+        let content =
+            fs::read_to_string(&config_path).map_err(|e| format!("无法读取配置文件: {}", e))?;
+        let config: AppConfig =
+            serde_json::from_str(&content).map_err(|e| format!("配置文件格式错误: {}", e))?;
         config.update_server_base_url
     } else {
         String::new()
@@ -266,7 +265,10 @@ async fn get_update_info(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
 
-    let response = client.get(&url).send().await
+    let response = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| format!("请求更新服务器失败（连接超时或网络错误）: {}", e))?;
 
     if response.status().is_success() {
@@ -280,7 +282,10 @@ async fn get_update_info(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
             url: Option<String>,
         }
 
-        let update_info: UpdateResponse = response.json().await.map_err(|e| format!("解析更新信息失败: {}", e))?;
+        let update_info: UpdateResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("解析更新信息失败: {}", e))?;
 
         // 比较版本号
         let available = update_info.version != current_version;
@@ -308,10 +313,10 @@ async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
     // 检查是否使用自定义更新服务器
     let config_path = get_config_path(&app)?;
     let update_server_base_url = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .map_err(|e| format!("无法读取配置文件: {}", e))?;
-        let config: AppConfig = serde_json::from_str(&content)
-            .map_err(|e| format!("配置文件格式错误: {}", e))?;
+        let content =
+            fs::read_to_string(&config_path).map_err(|e| format!("无法读取配置文件: {}", e))?;
+        let config: AppConfig =
+            serde_json::from_str(&content).map_err(|e| format!("配置文件格式错误: {}", e))?;
         config.update_server_base_url
     } else {
         String::new()
@@ -319,19 +324,18 @@ async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
 
     // 如果配置了自定义更新服务器，提示用户手动下载
     if !update_server_base_url.is_empty() {
-        return Err("使用自定义更新服务器时，请手动下载更新包。\n\n请联系管理员获取最新版本。".to_string());
+        return Err(
+            "使用自定义更新服务器时，请手动下载更新包。\n\n请联系管理员获取最新版本。".to_string(),
+        );
     }
 
     // 使用 Tauri 内置的 updater 插件
     let updater = app.updater().map_err(|e| e.to_string())?;
     if let Some(res) = updater.check().await.map_err(|e| e.to_string())? {
-        res.download_and_install(
-            |_chunk_length, _content_length| {},
-            || {},
-        )
-        .await
-        .map(|_| "Update downloaded successfully. Restart to apply.".to_string())
-        .map_err(|e| format!("Failed to install update: {}", e))
+        res.download_and_install(|_chunk_length, _content_length| {}, || {})
+            .await
+            .map(|_| "Update downloaded successfully. Restart to apply.".to_string())
+            .map_err(|e| format!("Failed to install update: {}", e))
     } else {
         Err("No update available".to_string())
     }
@@ -414,8 +418,13 @@ pub fn run() {
                                     let path = entry.path();
                                     let path_str = path.to_string_lossy();
                                     // 只删除 .log 或 .log.* 文件
-                                    if path.extension().map(|s| s.to_string_lossy()).unwrap_or_default() == "log" ||
-                                       path_str.ends_with(".log") {
+                                    if path
+                                        .extension()
+                                        .map(|s| s.to_string_lossy())
+                                        .unwrap_or_default()
+                                        == "log"
+                                        || path_str.ends_with(".log")
+                                    {
                                         let _ = std::fs::remove_file(&path);
                                         tracing::info!("清理过期日志文件: {:?}", path);
                                     }

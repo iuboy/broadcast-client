@@ -19,13 +19,13 @@
 //! ## 心跳机制
 //! 每 5 秒检查一次消息，超时时间 10 秒
 
+use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
-use tungstenite::Message;
-use tokio::sync::mpsc;
-use futures_util::{StreamExt, SinkExt};
 use tauri::Emitter;
+use tokio::sync::mpsc;
+use tungstenite::Message;
 
 /// 日志宏
 macro_rules! log_info {
@@ -94,7 +94,8 @@ impl WebSocketClientManager {
     pub fn send_audio(&self, data: Vec<u8>) -> Result<(), String> {
         let tx = self.audio_tx.lock();
         if let Some(tx) = tx.as_ref() {
-            tx.send(data).map_err(|e| format!("发送音频数据失败: {}", e))?;
+            tx.send(data)
+                .map_err(|e| format!("发送音频数据失败: {}", e))?;
             Ok(())
         } else {
             Err("未连接到服务器".to_string())
@@ -174,7 +175,9 @@ impl WebSocketClientManager {
                 &mut audio_rx,
                 &mut shutdown_rx,
                 state_clone,
-            ).await {
+            )
+            .await
+            {
                 log_error!("广播任务出错: {}", e);
                 let _ = app_clone.emit("broadcast-error", e.to_string());
             }
@@ -216,8 +219,9 @@ impl WebSocketClientManager {
         // 连接到服务器（带超时）
         let mut socket = tokio::time::timeout(
             Duration::from_secs(5),
-            tokio_tungstenite::connect_async(&url_str)
-        ).await
+            tokio_tungstenite::connect_async(&url_str),
+        )
+        .await
         .map_err(|_| format!("连接超时（5秒）: {}", url_str))?
         .map_err(|e| format!("连接失败: {}", e))?
         .0;
@@ -244,7 +248,8 @@ impl WebSocketClientManager {
 
         // 发送 start_broadcast
         log_info!("发送 start_broadcast");
-        socket.send(Message::Text("start_broadcast".to_string()))
+        socket
+            .send(Message::Text("start_broadcast".to_string()))
             .await
             .map_err(|e| format!("发送 start_broadcast 失败: {}", e))?;
 
@@ -338,7 +343,10 @@ impl WebSocketClientManager {
 
         // 发送 stop_broadcast
         log_info!("发送 stop_broadcast");
-        if let Err(e) = socket.send(Message::Text("stop_broadcast".to_string())).await {
+        if let Err(e) = socket
+            .send(Message::Text("stop_broadcast".to_string()))
+            .await
+        {
             log_error!("发送 stop_broadcast 失败: {}", e);
         }
 
@@ -393,8 +401,13 @@ pub async fn ws_start_broadcast(
     sample_rate: u32,
     channels: u16,
 ) -> Result<String, String> {
-    log_info!("ws_start_broadcast 被调用: url={}, codec={}, sampleRate={}, channels={}",
-        server_url, codec, sample_rate, channels);
+    log_info!(
+        "ws_start_broadcast 被调用: url={}, codec={}, sampleRate={}, channels={}",
+        server_url,
+        codec,
+        sample_rate,
+        channels
+    );
 
     WS_CLIENT.set_config(server_url, codec, sample_rate, channels);
     WS_CLIENT.start_broadcast(app_handle).await?;
