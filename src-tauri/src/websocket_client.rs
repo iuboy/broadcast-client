@@ -278,6 +278,9 @@ impl WebSocketClientManager {
         let _ = app_handle.emit("ws-broadcasting", ());
         log_info!("已发送 ws-broadcasting 事件到前端");
 
+        // 心跳定时器（每 4 秒发送一次，小于服务端 5 秒间隔）
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(4));
+
         // 广播循环：接收音频数据并发送
         loop {
             tokio::select! {
@@ -303,19 +306,30 @@ impl WebSocketClientManager {
                     break;
                 }
 
+                // 心跳定时器
+                _ = heartbeat_interval.tick() => {
+                    socket.send(Message::Text("heartbeat".to_string()))
+                        .await
+                        .map_err(|e| format!("发送心跳失败: {}", e))?;
+                }
+
                 // 接收服务端消息（超时）
                 result = tokio::time::timeout(Duration::from_millis(100), socket.next()) => {
                     match result {
                         Ok(Some(Ok(msg))) => {
                             match msg {
                                 Message::Text(text) => {
-                                    log_info!("收到服务端消息: {}", text);
-                                    if text == "idle" {
-                                        let _ = app_handle.emit("ws-idle", ());
-                                        break;
-                                    } else if text.starts_with("error:") {
-                                        let _ = app_handle.emit("ws-error", text);
-                                        break;
+                                    if text == "pong" {
+                                        // 心跳响应，无需处理
+                                    } else {
+                                        log_info!("收到服务端消息: {}", text);
+                                        if text == "idle" {
+                                            let _ = app_handle.emit("ws-idle", ());
+                                            break;
+                                        } else if text.starts_with("error:") {
+                                            let _ = app_handle.emit("ws-error", text);
+                                            break;
+                                        }
                                     }
                                 }
                                 Message::Close(_) => {
